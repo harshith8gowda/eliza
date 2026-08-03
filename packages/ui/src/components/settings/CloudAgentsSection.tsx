@@ -111,6 +111,7 @@ export function CloudAgentsSection() {
   // switch to it. Drives the "Waking <name>…" row state.
   const [wakingId, setWakingId] = useState<string | null>(null);
   const refreshRequestIdRef = useRef(0);
+  const isMountedRef = useRef(true);
   const activeId = useMemo(() => activeCloudAgentId(), []);
 
   const cloudApiBase = getBootConfig().cloudApiBase || "https://elizacloud.ai";
@@ -153,6 +154,7 @@ export function CloudAgentsSection() {
       // request is still live. Invalidating its ownership prevents that stale
       // result from updating either an unmounted view or the restarted effect.
       refreshRequestIdRef.current += 1;
+      isMountedRef.current = false;
     };
   }, [refresh]);
 
@@ -458,10 +460,12 @@ export function CloudAgentsSection() {
         await new Promise((resolve) =>
           setTimeout(resolve, STATUS_POLL_INTERVAL_MS),
         );
+        if (!isMountedRef.current) return;
         const res = await client.getCloudCompatAgentStatus(agentId);
         if (!res.success) continue;
         const status = res.data.status.toLowerCase();
         if (!status) continue;
+        if (!isMountedRef.current) return;
         setLocalStatus(agentId, status);
         // Once the agent reaches a settled (non-transitional) state there is
         // nothing left to reconcile — stop polling early.
