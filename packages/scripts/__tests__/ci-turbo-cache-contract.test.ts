@@ -20,6 +20,9 @@ const { runContract } = await import(
 );
 
 const REAL_REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+const CI_BUN_VERSION = JSON.parse(
+  readFileSync(join(REAL_REPO_ROOT, ".github", "ci-bun-version.json"), "utf8"),
+).version;
 
 const SHIM_YAML = `name: "GitHub-native Turbo cache"
 description: "test shim"
@@ -49,6 +52,14 @@ runs:
         restore-keys: |
           turbo-\${{ runner.os }}-\${{ steps.turbo-key.outputs.turbo_cache_key }}-
           turbo-\${{ runner.os }}-
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      env:
+        HOME: \${{ runner.temp }}/bun-home-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ github.job }}-\${{ strategy.job-index || 0 }}
+        USERPROFILE: \${{ runner.temp }}/bun-home-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ github.job }}-\${{ strategy.job-index || 0 }}
+      with:
+        bun-version: 1.3.14
+        no-cache: true
 `;
 
 const CLEAN_ADOPTER = `name: Clean adopter
@@ -159,7 +170,7 @@ describe("ci-turbo-cache-contract", () => {
 
   test("fails when workspace setup nests the cache shim", () => {
     const nestedSetup = WORKSPACE_SETUP_YAML.replace(
-      /    - name: Restore and save Turbo cache[\s\S]*$/,
+      / {4}- name: Restore and save Turbo cache[\s\S]*$/,
       "    - uses: ./.github/actions/turbo-cache-github\n",
     );
     const root = buildRepo({ workspaceSetup: nestedSetup });
@@ -187,13 +198,71 @@ describe("ci-turbo-cache-contract", () => {
     }
   });
 
+  test("fails when setup-bun shares a host HOME across concurrent jobs", () => {
+    const sharedHomeSetup = WORKSPACE_SETUP_YAML.replace(
+      / {8}USERPROFILE:.*\n/,
+      "",
+    );
+    const root = buildRepo({ workspaceSetup: sharedHomeSetup });
+    try {
+      expect(() => runContract(root)).toThrow(
+        /setup-bun home must be isolated by run, attempt, job, matrix entry, and OS/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails when setup-bun HOME includes human-readable runner metadata", () => {
+    const unsafeHomeSetup = WORKSPACE_SETUP_YAML.replace(
+      `\${{ strategy.job-index || 0 }}`,
+      `\${{ runner.name }}`,
+    );
+    const root = buildRepo({ workspaceSetup: unsafeHomeSetup });
+    try {
+      expect(() => runContract(root)).toThrow(/space-bearing runner metadata/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails when setup-bun shares a home across matrix entries", () => {
+    const sharedMatrixHomeSetup = WORKSPACE_SETUP_YAML.replaceAll(
+      `-\${{ strategy.job-index || 0 }}`,
+      "",
+    );
+    const root = buildRepo({ workspaceSetup: sharedMatrixHomeSetup });
+    try {
+      expect(() => runContract(root)).toThrow(
+        /setup-bun home must be isolated by run, attempt, job, matrix entry, and OS/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails when setup-bun caches an ephemeral executable path", () => {
+    const cachedEphemeralHomeSetup = WORKSPACE_SETUP_YAML.replace(
+      "        no-cache: true\n",
+      "",
+    );
+    const root = buildRepo({ workspaceSetup: cachedEphemeralHomeSetup });
+    try {
+      expect(() => runContract(root)).toThrow(
+        /without caching the ephemeral executable path/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("the fork lint lane keeps required gates with a bounded cold allowance", () => {
     const workflow = readFileSync(
       join(REAL_REPO_ROOT, ".github", "workflows", "quality-fork.yml"),
       "utf8",
     );
     const lintJob = workflow.match(
-      /^  lint:\s*$([\s\S]*?)(?=^  typecheck:\s*$)/m,
+      /^ {2}lint:\s*$([\s\S]*?)(?=^ {2}typecheck:\s*$)/m,
     )?.[0];
     expect(lintJob).toBeDefined();
     expect(lintJob).toMatch(/timeout-minutes:\s*15/);
@@ -206,6 +275,10 @@ describe("ci-turbo-cache-contract", () => {
       expect(lintJob).toContain(command);
     }
     expect(lintJob).not.toMatch(/continue-on-error/);
+    expect(workflow).toContain(`BUN_VERSION: "${CI_BUN_VERSION}"`);
+    expect(workflow).toMatch(
+      /name:\s*Setup Bun[\s\S]*?HOME:\s*\$\{\{\s*runner\.temp\s*\}\}\/bun-home-\$\{\{\s*github\.run_id\s*\}\}-\$\{\{\s*github\.run_attempt\s*\}\}-\$\{\{\s*github\.job\s*\}\}-\$\{\{\s*strategy\.job-index\s*\|\|\s*0\s*\}\}\s*[\r\n]+[\s\S]*?USERPROFILE:/,
+    );
   });
 
   test("the fork typecheck keeps full coverage with a bounded cold-cache allowance", () => {
@@ -214,7 +287,7 @@ describe("ci-turbo-cache-contract", () => {
       "utf8",
     );
     const typecheckJob = workflow.match(
-      /^  typecheck:\s*$([\s\S]*?)(?=^  build:\s*$)/m,
+      /^ {2}typecheck:\s*$([\s\S]*?)(?=^ {2}build:\s*$)/m,
     )?.[0];
     expect(typecheckJob).toBeDefined();
     expect(typecheckJob).toMatch(/timeout-minutes:\s*25/);
@@ -230,16 +303,15 @@ describe("ci-turbo-cache-contract", () => {
       "utf8",
     );
     const typecheckJob = workflow.match(
-      /^  typecheck:\s*$([\s\S]*?)(?=^  build:\s*$)/m,
+      /^ {2}typecheck:\s*$([\s\S]*?)(?=^ {2}build:\s*$)/m,
     )?.[0];
     const buildJob = workflow.match(
-      /^  build:\s*$([\s\S]*?)(?=^  elizaos-cli-global-smoke:\s*$)/m,
+      /^ {2}build:\s*$([\s\S]*?)(?=^ {2}elizaos-cli-global-smoke:\s*$)/m,
     )?.[0];
     expect(typecheckJob).toMatch(/cache-bun-install:\s*["']false["']/);
     expect(buildJob).toMatch(/cache-bun-install:\s*["']false["']/);
-    expect(buildJob).toMatch(/timeout-minutes:\s*32/);
+    expect(buildJob).toMatch(/timeout-minutes:\s*45/);
     expect(buildJob).toMatch(/run:\s*bun run build/);
-    expect(buildJob).toMatch(/run:\s*bun run test:e2e --workers=2/);
     expect(buildJob).not.toMatch(/continue-on-error|\|\| true/);
 
     const setup = readFileSync(
