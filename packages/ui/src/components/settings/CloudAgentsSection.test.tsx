@@ -837,6 +837,53 @@ describe("CloudAgentsSection load state (error vs empty)", () => {
     expect(screen.getByText("Newest")).toBeTruthy();
     expect(screen.queryByTestId("cloud-agents-empty")).toBeNull();
   });
+
+  it("does not let resyncStatus polling set state after unmount", async () => {
+    // Simulate a suspend call that starts resyncStatus polling, then
+    // unmount before the polls resolve. The isMountedRef guard must prevent
+    // setLocalStatus from firing after cleanup — otherwise jsdom produces
+    // unhandled "window is not defined" rejections.
+    let resolveStatusPoll:
+      | ((value: { success: true; data: { status: string } }) => void)
+      | undefined;
+    const pendingStatus = new Promise<{
+      success: true;
+      data: { status: string };
+    }>((resolve) => {
+      resolveStatusPoll = resolve;
+    });
+
+    clientMock.getCloudCompatAgents.mockResolvedValue({
+      success: true,
+      data: [agent()],
+    });
+    clientMock.suspendCloudCompatAgent.mockResolvedValue({
+      success: true,
+      data: {},
+    });
+    clientMock.getCloudCompatAgentStatus.mockReturnValue(pendingStatus);
+
+    const view = render(<CloudAgentsSection />);
+    await waitFor(() =>
+      expect(clientMock.getCloudCompatAgents).toHaveBeenCalledTimes(1),
+    );
+
+    // Trigger suspend — starts resyncStatus polling loop.
+    fireEvent.click(screen.getByTestId("suspend-agent-1"));
+    await waitFor(() =>
+      expect(clientMock.suspendCloudCompatAgent).toHaveBeenCalledTimes(1),
+    );
+
+    // Unmount while the poll is still pending.
+    view.unmount();
+
+    // Resolve the poll — must not throw or trigger a state update.
+    await act(async () => {
+      resolveStatusPoll?.({ success: true, data: { status: "stopped" } });
+      // Wait for the setTimeout(STATUS_POLL_INTERVAL_MS) to fire.
+      await new Promise((r) => setTimeout(r, 4000));
+    });
+  });
 });
 
 // The shared→dedicated handoff no longer drives this Settings row's "Waking…"
